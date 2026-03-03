@@ -4,26 +4,34 @@ import requests
 from lxml import etree
 from io import BytesIO
 
-# ✅ Provider base folder
+# ==========================================
+# Provider Base URL
+# ==========================================
 BASE_URL = "https://epgshare01.online/epgshare01/"
 
-# ✅ Speed settings (smaller = faster EPG in apps)
+# ==========================================
+# PERFORMANCE SETTINGS (FAST LOADING)
+# ==========================================
 KEEP_PAST_DAYS = 0
-KEEP_FUTURE_DAYS = 2
+KEEP_FUTURE_DAYS = 1   # 🔥 Reduced to 1 day for much faster IPTV loading
 
-# ✅ Timezone correction: normalize all programme start/stop to UTC (+0000)
+# Normalize all programme times to UTC (+0000)
 NORMALIZE_TIMES_TO_UTC = True
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (compatible; merged-epg/1.0; +https://github.com/Junior2237/merged-epg-filtered)",
+    "User-Agent": "Mozilla/5.0 (compatible; merged-epg/2.0; +https://github.com/Junior2237/merged-epg-filtered)",
     "Accept": "*/*",
 }
 
-# ✅ Output files
+# ==========================================
+# Output + Backup
+# ==========================================
 OUTPUT_NAME = "merged_epg.xml.gz"
-PREVIOUS_DIST = os.path.join("dist", "epg.xml.gz")  # backup file we always maintain
+PREVIOUS_DIST = os.path.join("dist", "epg.xml.gz")
 
-# ✅ Selected sources (your list)
+# ==========================================
+# Selected Sources
+# ==========================================
 FILES = [
     "epg_ripper_BEIN1.xml.gz",
     "epg_ripper_BR1.xml.gz",
@@ -53,11 +61,13 @@ FILES = [
     "locomotiontv.xml.gz",
 ]
 
-# Ensure BASE_URL always ends with /
 BASE_URL = BASE_URL.rstrip("/") + "/"
 URLS = [BASE_URL + f for f in FILES]
 
 
+# ==========================================
+# Time Handling
+# ==========================================
 def parse_xmltv_time(ts: str):
     if not ts:
         return None
@@ -79,7 +89,6 @@ def parse_xmltv_time(ts: str):
 
 
 def format_xmltv_utc(dt: datetime) -> str:
-    # XMLTV format: YYYYMMDDhhmmss +0000
     return dt.astimezone(timezone.utc).strftime("%Y%m%d%H%M%S") + " +0000"
 
 
@@ -100,6 +109,9 @@ def intersects_window(start_dt, stop_dt, win_start, win_end):
     return (start_dt <= win_end) and (stop_dt >= win_start)
 
 
+# ==========================================
+# Fetching
+# ==========================================
 def fetch_xml(url, retries=3):
     last = None
     for attempt in range(1, retries + 1):
@@ -108,7 +120,6 @@ def fetch_xml(url, retries=3):
             r.raise_for_status()
             content = r.content
 
-            # If server returns gz bytes, decompress automatically
             if content[:2] == b"\x1f\x8b":
                 content = gzip.decompress(content)
 
@@ -119,23 +130,28 @@ def fetch_xml(url, retries=3):
     raise last
 
 
+# ==========================================
+# Backup Handling
+# ==========================================
 def fallback_to_previous():
-    # If we have a previous dist file, copy it and exit success (0)
     if os.path.exists(PREVIOUS_DIST):
         shutil.copyfile(PREVIOUS_DIST, OUTPUT_NAME)
-        print("⚠️ All sources failed. Reused dist/epg.xml.gz backup so output stays working.")
+        print("⚠️ Using backup dist/epg.xml.gz")
         sys.exit(0)
 
-    print("❌ All sources failed and no dist/epg.xml.gz backup exists.")
+    print("❌ No backup exists and all sources failed.")
     sys.exit(1)
 
 
 def save_backup():
     os.makedirs("dist", exist_ok=True)
     shutil.copyfile(OUTPUT_NAME, PREVIOUS_DIST)
-    print(f"🧯 Backup updated: {PREVIOUS_DIST}")
+    print("🧯 Backup updated.")
 
 
+# ==========================================
+# Main
+# ==========================================
 def main():
     now = datetime.now(timezone.utc)
     win_start = now - timedelta(days=KEEP_PAST_DAYS)
@@ -151,25 +167,22 @@ def main():
             doc = fetch_xml(url)
             sources_ok += 1
         except Exception as e:
-            print(f"⚠️ Failed to fetch {url}: {e}", file=sys.stderr)
+            print(f"⚠️ Failed: {url} -> {e}", file=sys.stderr)
             continue
 
         root = doc.getroot()
 
-        # Channels
         for ch in root.findall("channel"):
             cid = ch.get("id") or ""
             if cid and cid not in channel_ids_seen:
                 channel_ids_seen.add(cid)
                 tv_root.append(ch)
 
-        # Programmes
         for pr in root.findall("programme"):
             ch_id = pr.get("channel") or ""
             start_s = pr.get("start") or ""
             stop_s = pr.get("stop") or ""
 
-            # ✅ Normalize times to UTC (optional)
             if NORMALIZE_TIMES_TO_UTC:
                 if start_s:
                     start_s = normalize_time_string(start_s)
@@ -193,18 +206,16 @@ def main():
             programme_keys_seen.add(key)
             tv_root.append(pr)
 
-    # If everything failed, fallback
-    if sources_ok == 0 or (len(channel_ids_seen) == 0 and len(programme_keys_seen) == 0):
+    if sources_ok == 0 or not programme_keys_seen:
         fallback_to_previous()
 
     tree = etree.ElementTree(tv_root)
     with gzip.open(OUTPUT_NAME, "wb") as f:
         tree.write(f, encoding="utf-8", xml_declaration=True, pretty_print=False)
 
-    # ✅ Always update backup if build succeeded
     save_backup()
 
-    print(f"✅ Merge OK. Sources: {sources_ok}/{len(URLS)} | Channels: {len(channel_ids_seen)} | Programmes: {len(programme_keys_seen)}")
+    print(f"✅ Done. Sources: {sources_ok}/{len(URLS)} | Channels: {len(channel_ids_seen)} | Programmes: {len(programme_keys_seen)}")
 
 
 if __name__ == "__main__":
