@@ -59,6 +59,10 @@ FILES = [
     "epg_ripper_US_LOCALS1.xml.gz",
     "epg_ripper_US_SPORTS1.xml.gz",
     "locomotiontv.xml.gz",
+    "epg_ripper_CH1.xml.gz",
+    "epg_ripper_FR1.xml.gz",
+    "epg_ripper_HK1.xml.gz",
+    "epg_ripper_NL1.xml.gz",
 ]
 
 BASE_URL = BASE_URL.rstrip("/") + "/"
