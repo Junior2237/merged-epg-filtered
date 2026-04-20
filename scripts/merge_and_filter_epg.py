@@ -70,6 +70,7 @@ FILES = [
     "epg_ripper_DE1.xml.gz",
     "epg_ripper_CZ1.xml.gz",
     "epg_ripper_BG1.xml.gz",
+    "epg_ripper_IT1.xml.gz",
 ]
 
 BASE_URL = BASE_URL.rstrip("/") + "/"
