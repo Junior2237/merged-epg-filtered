@@ -1,4 +1,4 @@
-```python
+
 import sys, re, gzip, os, shutil, time
 from datetime import datetime, timedelta, timezone
 import requests
