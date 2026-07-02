@@ -4,10 +4,13 @@ import gzip
 import os
 import shutil
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from lxml import etree
 
 
@@ -25,6 +28,12 @@ HEADERS = {
     "User-Agent": "Mozilla/5.0 (compatible; merged-epg/2.0; +https://github.com/Junior2237/merged-epg-filtered)",
     "Accept": "*/*",
 }
+
+# --- Performance knobs ---
+MAX_WORKERS = 10          # concurrent downloads instead of sequential
+REQUEST_TIMEOUT = 60      # per-attempt timeout (was 180 - too generous, let retries handle it)
+GZIP_COMPRESSLEVEL = 6    # 1=fastest/bigger, 9=slowest/smallest. 6 is a good speed/size tradeoff for build time.
+WRITE_UNCOMPRESSED_XML = False  # the app only needs the .gz; skip writing plain XML to save I/O
 
 DIST_DIR = "dist"
 OUTPUT_XML = os.path.join(DIST_DIR, "epg.xml")
@@ -64,6 +73,21 @@ FILES = [
 
 BASE_URL = BASE_URL.rstrip("/") + "/"
 URLS = [BASE_URL + f for f in FILES]
+
+
+def make_session():
+    """Session with connection pooling + built-in retry/backoff (replaces manual sleep loop)."""
+    session = requests.Session()
+    retry = Retry(
+        total=3,
+        backoff_factor=1.5,
+        status_forcelist=[429, 500, 502, 503, 504],
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry, pool_connections=MAX_WORKERS, pool_maxsize=MAX_WORKERS)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    return session
 
 
 def load_m3u_tvg_ids(path):
@@ -131,26 +155,45 @@ def intersects_window(start_dt, stop_dt, win_start, win_end):
     return start_dt <= win_end and stop_dt >= win_start
 
 
-def fetch_xml(url, retries=3):
-    last_error = None
+def fetch_bytes(session, url):
+    """Just fetch + decompress bytes (parsing happens separately, off the network-wait path)."""
+    response = session.get(url, timeout=REQUEST_TIMEOUT, headers=HEADERS)
+    response.raise_for_status()
+    content = response.content
 
-    for attempt in range(1, retries + 1):
-        try:
-            response = requests.get(url, timeout=180, headers=HEADERS)
-            response.raise_for_status()
+    if content[:2] == b"\x1f\x8b":
+        content = gzip.decompress(content)
 
-            content = response.content
+    return content
 
-            if content[:2] == b"\x1f\x8b":
-                content = gzip.decompress(content)
 
-            return etree.parse(BytesIO(content))
+def fetch_all(urls):
+    """
+    Download every source concurrently instead of one-at-a-time.
+    This is the single biggest speedup: with ~28 remote files, sequential
+    fetching means total time = sum of every request; concurrent fetching
+    means total time ~= slowest single request (bounded by MAX_WORKERS).
+    Results are returned in the same order as `urls` so merge priority
+    (first-seen-wins for channels/programmes) stays identical to the original.
+    """
+    session = make_session()
+    results = [None] * len(urls)
 
-        except Exception as e:
-            last_error = e
-            time.sleep(2 * attempt)
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+        future_to_idx = {
+            pool.submit(fetch_bytes, session, url): i
+            for i, url in enumerate(urls)
+        }
+        for future in as_completed(future_to_idx):
+            idx = future_to_idx[future]
+            url = urls[idx]
+            try:
+                results[idx] = future.result()
+            except Exception as e:
+                print(f"WARNING: Failed source: {url} -> {e}", file=sys.stderr)
+                results[idx] = None
 
-    raise last_error
+    return results
 
 
 def fallback_to_previous():
@@ -163,6 +206,7 @@ def fallback_to_previous():
 
 
 def main():
+    t0 = time.time()
     now = datetime.now(timezone.utc)
     win_start = now - timedelta(hours=KEEP_PAST_HOURS)
     win_end = now + timedelta(hours=KEEP_FUTURE_HOURS)
@@ -180,14 +224,22 @@ def main():
     skipped_channels = 0
     skipped_programmes = 0
 
-    for url in URLS:
-        try:
-            doc = fetch_xml(url)
-            sources_ok += 1
-        except Exception as e:
-            print(f"WARNING: Failed source: {url} -> {e}", file=sys.stderr)
+    # --- Phase 1: download everything concurrently ---
+    raw_contents = fetch_all(URLS)
+    print(f"Downloads finished in {time.time() - t0:.1f}s")
+
+    # --- Phase 2: parse + merge (CPU-bound, sequential is fine here since it's fast) ---
+    for url, content in zip(URLS, raw_contents):
+        if content is None:
             continue
 
+        try:
+            doc = etree.parse(BytesIO(content))
+        except Exception as e:
+            print(f"WARNING: Failed to parse: {url} -> {e}", file=sys.stderr)
+            continue
+
+        sources_ok += 1
         root = doc.getroot()
 
         for ch in root.findall("channel"):
@@ -237,6 +289,8 @@ def main():
             programme_keys_seen.add(key)
             tv_root.append(pr)
 
+        del doc
+
     if sources_ok == 0 or not programme_keys_seen:
         fallback_to_previous()
 
@@ -244,16 +298,17 @@ def main():
 
     tree = etree.ElementTree(tv_root)
 
-    tree.write(
-        OUTPUT_XML,
-        encoding="utf-8",
-        xml_declaration=True,
-        pretty_print=False,
-    )
-
-    with gzip.open(OUTPUT_GZ, "wb") as f:
+    if WRITE_UNCOMPRESSED_XML:
         tree.write(
-            f,
+            OUTPUT_XML,
+            encoding="utf-8",
+            xml_declaration=True,
+            pretty_print=False,
+        )
+
+    with gzip.GzipFile(OUTPUT_GZ, "wb", compresslevel=GZIP_COMPRESSLEVEL) as gz:
+        tree.write(
+            gz,
             encoding="utf-8",
             xml_declaration=True,
             pretty_print=False,
@@ -261,15 +316,20 @@ def main():
 
     shutil.copyfile(OUTPUT_GZ, LEGACY_OUTPUT_GZ)
 
+    elapsed = time.time() - t0
+    gz_size_mb = os.path.getsize(OUTPUT_GZ) / (1024 * 1024)
+
     print(
-        f"Done. Sources: {sources_ok}/{len(URLS)} | "
+        f"Done in {elapsed:.1f}s. Sources: {sources_ok}/{len(URLS)} | "
         f"Channels: {len(channel_ids_seen)} | "
         f"Programmes: {len(programme_keys_seen)} | "
         f"Skipped channels: {skipped_channels} | "
-        f"Skipped programmes: {skipped_programmes}"
+        f"Skipped programmes: {skipped_programmes} | "
+        f"Output size: {gz_size_mb:.2f} MB"
     )
 
-    print(f"XML: {OUTPUT_XML}")
+    if WRITE_UNCOMPRESSED_XML:
+        print(f"XML: {OUTPUT_XML}")
     print(f"GZ: {OUTPUT_GZ}")
     print(f"Legacy GZ: {LEGACY_OUTPUT_GZ}")
 
