@@ -17,7 +17,12 @@ from lxml import etree
 BASE_URL = "https://epgshare01.online/epgshare01/"
 
 KEEP_PAST_HOURS = 2
-KEEP_FUTURE_HOURS = 36
+KEEP_FUTURE_HOURS = 24  # was 36 - with no channel filter, every hour here multiplies across all 28 sources
+
+# Tags stripped from each <programme> to cut size. These are rarely rendered by IPTV apps
+# and can be some of the heaviest content per entry (esp. <credits> with full cast lists).
+# <desc> and <icon> are deliberately kept.
+STRIP_PROGRAMME_TAGS = {"credits", "star-rating", "rating", "review"}
 
 NORMALIZE_TIMES_TO_UTC = True
 
@@ -272,6 +277,10 @@ def main():
             if key in programme_keys_seen:
                 skipped_programmes += 1
                 continue
+
+            for tag in STRIP_PROGRAMME_TAGS:
+                for el in pr.findall(tag):
+                    pr.remove(el)
 
             programme_keys_seen.add(key)
             tv_root.append(pr)
