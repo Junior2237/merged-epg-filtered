@@ -32,7 +32,8 @@ HEADERS = {
 # --- Performance knobs ---
 MAX_WORKERS = 10          # concurrent downloads instead of sequential
 REQUEST_TIMEOUT = 60      # per-attempt timeout (was 180 - too generous, let retries handle it)
-GZIP_COMPRESSLEVEL = 6    # 1=fastest/bigger, 9=slowest/smallest. 6 is a good speed/size tradeoff for build time.
+GZIP_COMPRESSLEVEL = 9    # 1=fastest/bigger, 9=slowest/smallest. Build runs on GitHub's servers, not your device,
+                           # so build speed doesn't affect app load time — smallest file wins here.
 WRITE_UNCOMPRESSED_XML = False  # the app only needs the .gz; skip writing plain XML to save I/O
 
 DIST_DIR = "dist"
@@ -170,11 +171,9 @@ def fetch_bytes(session, url):
 def fetch_all(urls):
     """
     Download every source concurrently instead of one-at-a-time.
-    This is the single biggest speedup: with ~28 remote files, sequential
-    fetching means total time = sum of every request; concurrent fetching
-    means total time ~= slowest single request (bounded by MAX_WORKERS).
-    Results are returned in the same order as `urls` so merge priority
-    (first-seen-wins for channels/programmes) stays identical to the original.
+    Total time ~= slowest single request (bounded by MAX_WORKERS), not the
+    sum of all requests. Results stay in original order so merge priority
+    (first-seen-wins for channels/programmes) is unchanged.
     """
     session = make_session()
     results = [None] * len(urls)
@@ -209,130 +208,4 @@ def main():
     t0 = time.time()
     now = datetime.now(timezone.utc)
     win_start = now - timedelta(hours=KEEP_PAST_HOURS)
-    win_end = now + timedelta(hours=KEEP_FUTURE_HOURS)
-
-    if FILTER_BY_M3U:
-        allowed_channel_ids = load_m3u_tvg_ids(M3U_FILE)
-    else:
-        allowed_channel_ids = None
-
-    tv_root = etree.Element("tv")
-    channel_ids_seen = set()
-    programme_keys_seen = set()
-
-    sources_ok = 0
-    skipped_channels = 0
-    skipped_programmes = 0
-
-    # --- Phase 1: download everything concurrently ---
-    raw_contents = fetch_all(URLS)
-    print(f"Downloads finished in {time.time() - t0:.1f}s")
-
-    # --- Phase 2: parse + merge (CPU-bound, sequential is fine here since it's fast) ---
-    for url, content in zip(URLS, raw_contents):
-        if content is None:
-            continue
-
-        try:
-            doc = etree.parse(BytesIO(content))
-        except Exception as e:
-            print(f"WARNING: Failed to parse: {url} -> {e}", file=sys.stderr)
-            continue
-
-        sources_ok += 1
-        root = doc.getroot()
-
-        for ch in root.findall("channel"):
-            cid = ch.get("id") or ""
-
-            if allowed_channel_ids is not None and cid not in allowed_channel_ids:
-                skipped_channels += 1
-                continue
-
-            if cid and cid not in channel_ids_seen:
-                channel_ids_seen.add(cid)
-                tv_root.append(ch)
-
-        for pr in root.findall("programme"):
-            ch_id = pr.get("channel") or ""
-
-            if allowed_channel_ids is not None and ch_id not in allowed_channel_ids:
-                skipped_programmes += 1
-                continue
-
-            start_s = pr.get("start") or ""
-            stop_s = pr.get("stop") or ""
-
-            if NORMALIZE_TIMES_TO_UTC:
-                if start_s:
-                    start_s = normalize_time_string(start_s)
-                    pr.set("start", start_s)
-
-                if stop_s:
-                    stop_s = normalize_time_string(stop_s)
-                    pr.set("stop", stop_s)
-
-            start_dt = parse_xmltv_time(start_s)
-            stop_dt = parse_xmltv_time(stop_s)
-
-            if not intersects_window(start_dt, stop_dt, win_start, win_end):
-                skipped_programmes += 1
-                continue
-
-            title_text = (pr.findtext("title") or "").strip()
-            key = (ch_id, start_s, stop_s, title_text)
-
-            if key in programme_keys_seen:
-                skipped_programmes += 1
-                continue
-
-            programme_keys_seen.add(key)
-            tv_root.append(pr)
-
-        del doc
-
-    if sources_ok == 0 or not programme_keys_seen:
-        fallback_to_previous()
-
-    os.makedirs(DIST_DIR, exist_ok=True)
-
-    tree = etree.ElementTree(tv_root)
-
-    if WRITE_UNCOMPRESSED_XML:
-        tree.write(
-            OUTPUT_XML,
-            encoding="utf-8",
-            xml_declaration=True,
-            pretty_print=False,
-        )
-
-    with gzip.GzipFile(OUTPUT_GZ, "wb", compresslevel=GZIP_COMPRESSLEVEL) as gz:
-        tree.write(
-            gz,
-            encoding="utf-8",
-            xml_declaration=True,
-            pretty_print=False,
-        )
-
-    shutil.copyfile(OUTPUT_GZ, LEGACY_OUTPUT_GZ)
-
-    elapsed = time.time() - t0
-    gz_size_mb = os.path.getsize(OUTPUT_GZ) / (1024 * 1024)
-
-    print(
-        f"Done in {elapsed:.1f}s. Sources: {sources_ok}/{len(URLS)} | "
-        f"Channels: {len(channel_ids_seen)} | "
-        f"Programmes: {len(programme_keys_seen)} | "
-        f"Skipped channels: {skipped_channels} | "
-        f"Skipped programmes: {skipped_programmes} | "
-        f"Output size: {gz_size_mb:.2f} MB"
-    )
-
-    if WRITE_UNCOMPRESSED_XML:
-        print(f"XML: {OUTPUT_XML}")
-    print(f"GZ: {OUTPUT_GZ}")
-    print(f"Legacy GZ: {LEGACY_OUTPUT_GZ}")
-
-
-if __name__ == "__main__":
-    main()
+    win_end = now +
