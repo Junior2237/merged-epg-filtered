@@ -4,45 +4,68 @@ import gzip
 import os
 import shutil
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
 
 import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 from lxml import etree
 
 
+# ==========================================
+# Provider
+# ==========================================
+
 BASE_URL = "https://epgshare01.online/epgshare01/"
 
+
+# ==========================================
+# UHF OPTIMIZATION
+# ==========================================
+
+# Keep a very small amount of old guide data
 KEEP_PAST_HOURS = 2
-KEEP_FUTURE_HOURS = 24  # was 36 - with no channel filter, every hour here multiplies across all 28 sources
 
-# Tags stripped from each <programme> to cut size. These are rarely rendered by IPTV apps
-# and can be some of the heaviest content per entry (esp. <credits> with full cast lists).
-# <desc> and <icon> are deliberately kept.
-STRIP_PROGRAMME_TAGS = {"credits", "star-rating", "rating", "review"}
+# Enough future data so UHF does not quickly run out
+KEEP_FUTURE_HOURS = 36
 
+# Keep all available channels
+FILTER_BY_M3U = False
+
+# Normalize XMLTV timestamps to UTC
 NORMALIZE_TIMES_TO_UTC = True
 
-FILTER_BY_M3U = False
-M3U_FILE = "playlist.m3u"
+
+# ==========================================
+# HTTP
+# ==========================================
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (compatible; merged-epg/2.0; +https://github.com/Junior2237/merged-epg-filtered)",
+    "User-Agent": (
+        "Mozilla/5.0 "
+        "(compatible; merged-epg/3.0; "
+        "+https://github.com/Junior2237/merged-epg-filtered)"
+    ),
     "Accept": "*/*",
 }
 
-MAX_WORKERS = 10
-REQUEST_TIMEOUT = 60
-GZIP_COMPRESSLEVEL = 9
-WRITE_UNCOMPRESSED_XML = False
+
+# ==========================================
+# Output
+# ==========================================
 
 DIST_DIR = "dist"
+
 OUTPUT_XML = os.path.join(DIST_DIR, "epg.xml")
 OUTPUT_GZ = os.path.join(DIST_DIR, "epg.xml.gz")
+
+# Keep this for compatibility with anything
+# still using the old root filename.
 LEGACY_OUTPUT_GZ = "merged_epg.xml.gz"
+
+
+# ==========================================
+# EPG Sources
+# ==========================================
 
 FILES = [
     "epg_ripper_BEIN1.xml.gz",
@@ -76,258 +99,472 @@ FILES = [
 ]
 
 BASE_URL = BASE_URL.rstrip("/") + "/"
-URLS = [BASE_URL + f for f in FILES]
+URLS = [BASE_URL + filename for filename in FILES]
 
 
-def make_session():
-    session = requests.Session()
-    retry = Retry(
-        total=3,
-        backoff_factor=1.5,
-        status_forcelist=[429, 500, 502, 503, 504],
-        raise_on_status=False,
-    )
-    adapter = HTTPAdapter(max_retries=retry, pool_connections=MAX_WORKERS, pool_maxsize=MAX_WORKERS)
-    session.mount("https://", adapter)
-    session.mount("http://", adapter)
-    return session
-
-
-def load_m3u_tvg_ids(path):
-    if not os.path.exists(path):
-        print(f"WARNING: M3U file not found: {path}. No channel filtering applied.")
-        return None
-
-    ids = set()
-
-    with open(path, "r", encoding="utf-8", errors="ignore") as f:
-        text = f.read()
-
-    for match in re.findall(r'tvg-id="([^"]+)"', text):
-        value = match.strip()
-        if value:
-            ids.add(value)
-
-    print(f"Loaded {len(ids)} tvg-id values from M3U.")
-    return ids
-
+# ==========================================
+# XMLTV TIME HANDLING
+# ==========================================
 
 def parse_xmltv_time(ts):
     if not ts:
         return None
 
-    m = re.match(r"(\d{14})(?:\s*([+\-]\d{4}|Z))?", ts)
-    if not m:
+    match = re.match(
+        r"(\d{14})(?:\s*([+\-]\d{4}|Z))?",
+        ts
+    )
+
+    if not match:
         return None
 
-    base = datetime.strptime(m.group(1), "%Y%m%d%H%M%S")
-    tz = m.group(2)
+    base = datetime.strptime(
+        match.group(1),
+        "%Y%m%d%H%M%S"
+    )
 
-    if tz and tz != "Z":
-        sign = 1 if tz[0] == "+" else -1
-        hours = int(tz[1:3])
-        mins = int(tz[3:5])
-        offset = timezone(sign * timedelta(hours=hours, minutes=mins))
-        return base.replace(tzinfo=offset).astimezone(timezone.utc)
+    tz_string = match.group(2)
+
+    if tz_string and tz_string != "Z":
+        sign = 1 if tz_string[0] == "+" else -1
+
+        hours = int(tz_string[1:3])
+        minutes = int(tz_string[3:5])
+
+        offset = timezone(
+            sign * timedelta(
+                hours=hours,
+                minutes=minutes
+            )
+        )
+
+        return (
+            base
+            .replace(tzinfo=offset)
+            .astimezone(timezone.utc)
+        )
 
     return base.replace(tzinfo=timezone.utc)
 
 
 def format_xmltv_utc(dt):
-    return dt.astimezone(timezone.utc).strftime("%Y%m%d%H%M%S") + " +0000"
+    return (
+        dt.astimezone(timezone.utc)
+        .strftime("%Y%m%d%H%M%S")
+        + " +0000"
+    )
 
 
 def normalize_time_string(ts):
     dt = parse_xmltv_time(ts)
-    if not dt:
+
+    if dt is None:
         return ts
 
     return format_xmltv_utc(dt)
 
 
-def intersects_window(start_dt, stop_dt, win_start, win_end):
-    if not start_dt and not stop_dt:
-        return True
+def intersects_window(
+    start_dt,
+    stop_dt,
+    window_start,
+    window_end
+):
+    if start_dt is None and stop_dt is None:
+        return False
 
-    if not start_dt:
-        return stop_dt >= win_start
+    if start_dt is None:
+        return stop_dt >= window_start
 
-    if not stop_dt:
-        return start_dt <= win_end
+    if stop_dt is None:
+        return start_dt <= window_end
 
-    return start_dt <= win_end and stop_dt >= win_start
-
-
-def fetch_bytes(session, url):
-    response = session.get(url, timeout=REQUEST_TIMEOUT, headers=HEADERS)
-    response.raise_for_status()
-    content = response.content
-
-    if content[:2] == b"\x1f\x8b":
-        content = gzip.decompress(content)
-
-    return content
+    return (
+        start_dt <= window_end
+        and stop_dt >= window_start
+    )
 
 
-def fetch_all(urls):
-    session = make_session()
-    results = [None] * len(urls)
+# ==========================================
+# DOWNLOAD
+# ==========================================
 
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
-        future_to_idx = {
-            pool.submit(fetch_bytes, session, url): i
-            for i, url in enumerate(urls)
-        }
-        for future in as_completed(future_to_idx):
-            idx = future_to_idx[future]
-            url = urls[idx]
-            try:
-                results[idx] = future.result()
-            except Exception as e:
-                print(f"WARNING: Failed source: {url} -> {e}", file=sys.stderr)
-                results[idx] = None
+def fetch_xml(url, retries=3):
+    last_error = None
 
-    return results
+    for attempt in range(1, retries + 1):
+        try:
+            response = requests.get(
+                url,
+                timeout=180,
+                headers=HEADERS
+            )
 
+            response.raise_for_status()
+
+            content = response.content
+
+            # Detect gzip by magic bytes
+            if content[:2] == b"\x1f\x8b":
+                content = gzip.decompress(content)
+
+            parser = etree.XMLParser(
+                recover=True,
+                huge_tree=True
+            )
+
+            return etree.parse(
+                BytesIO(content),
+                parser
+            )
+
+        except Exception as exc:
+            last_error = exc
+
+            print(
+                f"Attempt {attempt}/{retries} failed "
+                f"for {url}: {exc}",
+                file=sys.stderr
+            )
+
+            if attempt < retries:
+                time.sleep(2 * attempt)
+
+    raise last_error
+
+
+# ==========================================
+# FALLBACK
+# ==========================================
 
 def fallback_to_previous():
-    if os.path.exists(OUTPUT_XML) or os.path.exists(OUTPUT_GZ) or os.path.exists(LEGACY_OUTPUT_GZ):
-        print("WARNING: Build failed, but existing output is preserved.")
+    if (
+        os.path.exists(OUTPUT_GZ)
+        or os.path.exists(LEGACY_OUTPUT_GZ)
+    ):
+        print(
+            "WARNING: No new valid EPG was generated. "
+            "Existing EPG files are being preserved."
+        )
         sys.exit(0)
 
-    print("ERROR: No valid output exists and no programmes were generated.")
+    print(
+        "ERROR: No programmes were generated "
+        "and no previous EPG exists."
+    )
+
     sys.exit(1)
 
 
+# ==========================================
+# MAIN
+# ==========================================
+
 def main():
-    t0 = time.time()
     now = datetime.now(timezone.utc)
-    win_start = now - timedelta(hours=KEEP_PAST_HOURS)
-    win_end = now + timedelta(hours=KEEP_FUTURE_HOURS)
 
-    if FILTER_BY_M3U:
-        allowed_channel_ids = load_m3u_tvg_ids(M3U_FILE)
-    else:
-        allowed_channel_ids = None
+    window_start = now - timedelta(
+        hours=KEEP_PAST_HOURS
+    )
 
-    tv_root = etree.Element("tv")
+    window_end = now + timedelta(
+        hours=KEEP_FUTURE_HOURS
+    )
+
+    print(
+        "EPG window:",
+        window_start.isoformat(),
+        "->",
+        window_end.isoformat()
+    )
+
+    # Important:
+    # channels and programmes are kept separately.
+    #
+    # XMLTV expects:
+    #
+    # <tv>
+    #   <channel />
+    #   <channel />
+    #   ...
+    #   <programme />
+    #   <programme />
+    # </tv>
+
+    channels = []
+    programmes = []
+
     channel_ids_seen = set()
     programme_keys_seen = set()
 
     sources_ok = 0
-    skipped_channels = 0
-    skipped_programmes = 0
+    sources_failed = 0
 
-    raw_contents = fetch_all(URLS)
-    print(f"Downloads finished in {time.time() - t0:.1f}s")
+    skipped_programmes_time = 0
+    skipped_programmes_duplicate = 0
 
-    for url, content in zip(URLS, raw_contents):
-        if content is None:
-            continue
+    for url in URLS:
+        print(f"Downloading: {url}")
 
         try:
-            doc = etree.parse(BytesIO(content))
-        except Exception as e:
-            print(f"WARNING: Failed to parse: {url} -> {e}", file=sys.stderr)
+            document = fetch_xml(url)
+            sources_ok += 1
+
+        except Exception as exc:
+            sources_failed += 1
+
+            print(
+                f"WARNING: Failed source: "
+                f"{url} -> {exc}",
+                file=sys.stderr
+            )
+
             continue
 
-        sources_ok += 1
-        root = doc.getroot()
+        root = document.getroot()
 
-        for ch in root.findall("channel"):
-            cid = ch.get("id") or ""
+        # ----------------------------------
+        # CHANNELS
+        # ----------------------------------
 
-            if allowed_channel_ids is not None and cid not in allowed_channel_ids:
-                skipped_channels += 1
+        for channel in root.findall("channel"):
+            channel_id = channel.get("id")
+
+            if not channel_id:
                 continue
 
-            if cid and cid not in channel_ids_seen:
-                channel_ids_seen.add(cid)
-                tv_root.append(ch)
-
-        for pr in root.findall("programme"):
-            ch_id = pr.get("channel") or ""
-
-            if allowed_channel_ids is not None and ch_id not in allowed_channel_ids:
-                skipped_programmes += 1
+            if channel_id in channel_ids_seen:
                 continue
 
-            start_s = pr.get("start") or ""
-            stop_s = pr.get("stop") or ""
+            channel_ids_seen.add(channel_id)
+
+            # Detach safely from source tree
+            channels.append(channel)
+
+        # ----------------------------------
+        # PROGRAMMES
+        # ----------------------------------
+
+        for programme in root.findall("programme"):
+            channel_id = (
+                programme.get("channel")
+                or ""
+            )
+
+            start_string = (
+                programme.get("start")
+                or ""
+            )
+
+            stop_string = (
+                programme.get("stop")
+                or ""
+            )
 
             if NORMALIZE_TIMES_TO_UTC:
-                if start_s:
-                    start_s = normalize_time_string(start_s)
-                    pr.set("start", start_s)
+                if start_string:
+                    start_string = (
+                        normalize_time_string(
+                            start_string
+                        )
+                    )
 
-                if stop_s:
-                    stop_s = normalize_time_string(stop_s)
-                    pr.set("stop", stop_s)
+                    programme.set(
+                        "start",
+                        start_string
+                    )
 
-            start_dt = parse_xmltv_time(start_s)
-            stop_dt = parse_xmltv_time(stop_s)
+                if stop_string:
+                    stop_string = (
+                        normalize_time_string(
+                            stop_string
+                        )
+                    )
 
-            if not intersects_window(start_dt, stop_dt, win_start, win_end):
-                skipped_programmes += 1
+                    programme.set(
+                        "stop",
+                        stop_string
+                    )
+
+            start_dt = parse_xmltv_time(
+                start_string
+            )
+
+            stop_dt = parse_xmltv_time(
+                stop_string
+            )
+
+            if not intersects_window(
+                start_dt,
+                stop_dt,
+                window_start,
+                window_end
+            ):
+                skipped_programmes_time += 1
                 continue
 
-            title_text = (pr.findtext("title") or "").strip()
-            key = (ch_id, start_s, stop_s, title_text)
+            title = (
+                programme.findtext("title")
+                or ""
+            ).strip()
+
+            key = (
+                channel_id,
+                start_string,
+                stop_string,
+                title
+            )
 
             if key in programme_keys_seen:
-                skipped_programmes += 1
+                skipped_programmes_duplicate += 1
                 continue
 
-            for tag in STRIP_PROGRAMME_TAGS:
-                for el in pr.findall(tag):
-                    pr.remove(el)
-
             programme_keys_seen.add(key)
-            tv_root.append(pr)
 
-        del doc
+            programmes.append(programme)
 
-    if sources_ok == 0 or not programme_keys_seen:
+    # ======================================
+    # VALIDATION
+    # ======================================
+
+    if sources_ok == 0:
         fallback_to_previous()
 
-    os.makedirs(DIST_DIR, exist_ok=True)
+    if not channels:
+        fallback_to_previous()
+
+    if not programmes:
+        fallback_to_previous()
+
+    # ======================================
+    # CREATE CORRECT XMLTV ORDER
+    # ======================================
+
+    tv_root = etree.Element(
+        "tv",
+        attrib={
+            "generator-info-name": "merged-epg-filtered",
+            "generator-info-url": (
+                "https://github.com/"
+                "Junior2237/"
+                "merged-epg-filtered"
+            )
+        }
+    )
+
+    # ALL channels first
+    for channel in channels:
+        tv_root.append(channel)
+
+    # THEN all programmes
+    for programme in programmes:
+        tv_root.append(programme)
 
     tree = etree.ElementTree(tv_root)
 
-    if WRITE_UNCOMPRESSED_XML:
-        tree.write(
-            OUTPUT_XML,
-            encoding="utf-8",
-            xml_declaration=True,
-            pretty_print=False,
-        )
+    # ======================================
+    # OUTPUT
+    # ======================================
 
-    with gzip.GzipFile(OUTPUT_GZ, "wb", compresslevel=GZIP_COMPRESSLEVEL) as gz:
-        tree.write(
-            gz,
-            encoding="utf-8",
-            xml_declaration=True,
-            pretty_print=False,
-        )
-
-    shutil.copyfile(OUTPUT_GZ, LEGACY_OUTPUT_GZ)
-
-    elapsed = time.time() - t0
-    gz_size_mb = os.path.getsize(OUTPUT_GZ) / (1024 * 1024)
-
-    print(
-        f"Done in {elapsed:.1f}s. Sources: {sources_ok}/{len(URLS)} | "
-        f"Channels: {len(channel_ids_seen)} | "
-        f"Programmes: {len(programme_keys_seen)} | "
-        f"Skipped channels: {skipped_channels} | "
-        f"Skipped programmes: {skipped_programmes} | "
-        f"Output size: {gz_size_mb:.2f} MB"
+    os.makedirs(
+        DIST_DIR,
+        exist_ok=True
     )
 
-    if WRITE_UNCOMPRESSED_XML:
-        print(f"XML: {OUTPUT_XML}")
-    print(f"GZ: {OUTPUT_GZ}")
-    print(f"Legacy GZ: {LEGACY_OUTPUT_GZ}")
+    tree.write(
+        OUTPUT_XML,
+        encoding="utf-8",
+        xml_declaration=True,
+        pretty_print=False
+    )
+
+    with gzip.open(
+        OUTPUT_GZ,
+        "wb",
+        compresslevel=9
+    ) as gz_file:
+
+        tree.write(
+            gz_file,
+            encoding="utf-8",
+            xml_declaration=True,
+            pretty_print=False
+        )
+
+    # Legacy/root copy
+    shutil.copyfile(
+        OUTPUT_GZ,
+        LEGACY_OUTPUT_GZ
+    )
+
+    # ======================================
+    # RESULT
+    # ======================================
+
+    xml_size_mb = (
+        os.path.getsize(OUTPUT_XML)
+        / 1024
+        / 1024
+    )
+
+    gz_size_mb = (
+        os.path.getsize(OUTPUT_GZ)
+        / 1024
+        / 1024
+    )
+
+    print("")
+    print("====================================")
+    print("EPG BUILD COMPLETE")
+    print("====================================")
+
+    print(
+        f"Sources OK: "
+        f"{sources_ok}/{len(URLS)}"
+    )
+
+    print(
+        f"Sources failed: "
+        f"{sources_failed}"
+    )
+
+    print(
+        f"Channels: "
+        f"{len(channel_ids_seen)}"
+    )
+
+    print(
+        f"Programmes: "
+        f"{len(programme_keys_seen)}"
+    )
+
+    print(
+        f"Skipped by time: "
+        f"{skipped_programmes_time}"
+    )
+
+    print(
+        f"Skipped duplicates: "
+        f"{skipped_programmes_duplicate}"
+    )
+
+    print(
+        f"XML size: "
+        f"{xml_size_mb:.2f} MB"
+    )
+
+    print(
+        f"GZIP size: "
+        f"{gz_size_mb:.2f} MB"
+    )
+
+    print("")
+    print(f"XML: {OUTPUT_XML}")
+    print(f"GZIP: {OUTPUT_GZ}")
+    print(
+        f"Compatibility copy: "
+        f"{LEGACY_OUTPUT_GZ}"
+    )
 
 
 if __name__ == "__main__":
