@@ -2,7 +2,6 @@ name: Merge EPG
 
 on:
   workflow_dispatch:
-
   schedule:
     - cron: "0 */6 * * *"
 
@@ -33,22 +32,8 @@ jobs:
         run: |
           python scripts/merge_and_filter_epg.py
 
-      - name: Commit result
-        run: |
-          git config user.name "github-actions"
-          git config user.email "github-actions@github.com"
-
-          rm -f dist/epg.xml
-
-          git add -A
-
-          if git diff --cached --quiet; then
-            echo "No EPG changes to commit."
-            exit 0
-          fi
-
-          git commit -m "Update EPG"
-          git push        shell: bash
+      - name: Commit EPG
+        shell: bash
         run: |
           set -e
 
@@ -60,32 +45,10 @@ jobs:
           git add dist/epg.xml.gz
           git add merged_epg.xml.gz
 
-          if git diff --cached --quiet
-          then
+          if git diff --cached --quiet; then
             echo "No EPG changes to commit."
             exit 0
           fi
 
           git commit -m "Update EPG"
-          git push origin HEAD:main          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
-          git add -A dist
-          git add merged_epg.xml.gz
-
-          if git diff --cached --quiet; then
-            echo "No changes to commit."
-          else
-            git commit -m "Update EPG"
-            git push
-          fi          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
-          git add dist/epg.xml
-          git add dist/epg.xml.gz
-          git add merged_epg.xml.gz
-
-          if git diff --cached --quiet; then
-            echo "No changes to commit."
-          else
-            git commit -m "Update EPG"
-            git push
-          fi
+          git push origin HEAD:main
