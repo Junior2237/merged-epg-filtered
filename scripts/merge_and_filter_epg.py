@@ -22,16 +22,13 @@ BASE_URL = "https://epgshare01.online/epgshare01/"
 # UHF OPTIMIZATION
 # ==========================================
 
-# Keep a very small amount of old guide data
+# Small amount of past guide data
 KEEP_PAST_HOURS = 2
 
-# Enough future data so UHF does not quickly run out
+# Future buffer so UHF does not quickly run out of guide data
 KEEP_FUTURE_HOURS = 36
 
-# Keep all available channels
-FILTER_BY_M3U = False
-
-# Normalize XMLTV timestamps to UTC
+# Keep ALL available channels
 NORMALIZE_TIMES_TO_UTC = True
 
 
@@ -42,7 +39,7 @@ NORMALIZE_TIMES_TO_UTC = True
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 "
-        "(compatible; merged-epg/3.0; "
+        "(compatible; merged-epg/3.1; "
         "+https://github.com/Junior2237/merged-epg-filtered)"
     ),
     "Accept": "*/*",
@@ -55,11 +52,11 @@ HEADERS = {
 
 DIST_DIR = "dist"
 
-OUTPUT_XML = os.path.join(DIST_DIR, "epg.xml")
+# Only compressed EPG is generated.
+# The uncompressed XML was over GitHub's 100 MB limit.
 OUTPUT_GZ = os.path.join(DIST_DIR, "epg.xml.gz")
 
-# Keep this for compatibility with anything
-# still using the old root filename.
+# Compatibility copy in repository root
 LEGACY_OUTPUT_GZ = "merged_epg.xml.gz"
 
 
@@ -103,7 +100,7 @@ URLS = [BASE_URL + filename for filename in FILES]
 
 
 # ==========================================
-# XMLTV TIME HANDLING
+# XMLTV Time Handling
 # ==========================================
 
 def parse_xmltv_time(ts):
@@ -186,7 +183,7 @@ def intersects_window(
 
 
 # ==========================================
-# DOWNLOAD
+# Download
 # ==========================================
 
 def fetch_xml(url, retries=3):
@@ -204,7 +201,6 @@ def fetch_xml(url, retries=3):
 
             content = response.content
 
-            # Detect gzip by magic bytes
             if content[:2] == b"\x1f\x8b":
                 content = gzip.decompress(content)
 
@@ -234,7 +230,7 @@ def fetch_xml(url, retries=3):
 
 
 # ==========================================
-# FALLBACK
+# Fallback
 # ==========================================
 
 def fallback_to_previous():
@@ -244,7 +240,7 @@ def fallback_to_previous():
     ):
         print(
             "WARNING: No new valid EPG was generated. "
-            "Existing EPG files are being preserved."
+            "Existing EPG is being preserved."
         )
         sys.exit(0)
 
@@ -257,7 +253,7 @@ def fallback_to_previous():
 
 
 # ==========================================
-# MAIN
+# Main
 # ==========================================
 
 def main():
@@ -278,10 +274,9 @@ def main():
         window_end.isoformat()
     )
 
-    # Important:
-    # channels and programmes are kept separately.
+    # Keep channels and programmes separately.
     #
-    # XMLTV expects:
+    # XMLTV structure:
     #
     # <tv>
     #   <channel />
@@ -302,6 +297,7 @@ def main():
 
     skipped_programmes_time = 0
     skipped_programmes_duplicate = 0
+    skipped_programmes_invalid = 0
 
     for url in URLS:
         print(f"Downloading: {url}")
@@ -323,9 +319,9 @@ def main():
 
         root = document.getroot()
 
-        # ----------------------------------
-        # CHANNELS
-        # ----------------------------------
+        # ==================================
+        # Channels
+        # ==================================
 
         for channel in root.findall("channel"):
             channel_id = channel.get("id")
@@ -337,19 +333,21 @@ def main():
                 continue
 
             channel_ids_seen.add(channel_id)
-
-            # Detach safely from source tree
             channels.append(channel)
 
-        # ----------------------------------
-        # PROGRAMMES
-        # ----------------------------------
+        # ==================================
+        # Programmes
+        # ==================================
 
         for programme in root.findall("programme"):
             channel_id = (
                 programme.get("channel")
                 or ""
             )
+
+            if not channel_id:
+                skipped_programmes_invalid += 1
+                continue
 
             start_string = (
                 programme.get("start")
@@ -363,10 +361,8 @@ def main():
 
             if NORMALIZE_TIMES_TO_UTC:
                 if start_string:
-                    start_string = (
-                        normalize_time_string(
-                            start_string
-                        )
+                    start_string = normalize_time_string(
+                        start_string
                     )
 
                     programme.set(
@@ -375,10 +371,8 @@ def main():
                     )
 
                 if stop_string:
-                    stop_string = (
-                        normalize_time_string(
-                            stop_string
-                        )
+                    stop_string = normalize_time_string(
+                        stop_string
                     )
 
                     programme.set(
@@ -393,6 +387,10 @@ def main():
             stop_dt = parse_xmltv_time(
                 stop_string
             )
+
+            if start_dt is None:
+                skipped_programmes_invalid += 1
+                continue
 
             if not intersects_window(
                 start_dt,
@@ -420,11 +418,10 @@ def main():
                 continue
 
             programme_keys_seen.add(key)
-
             programmes.append(programme)
 
     # ======================================
-    # VALIDATION
+    # Validation
     # ======================================
 
     if sources_ok == 0:
@@ -437,7 +434,7 @@ def main():
         fallback_to_previous()
 
     # ======================================
-    # CREATE CORRECT XMLTV ORDER
+    # Correct XMLTV ordering
     # ======================================
 
     tv_root = etree.Element(
@@ -452,18 +449,18 @@ def main():
         }
     )
 
-    # ALL channels first
+    # All channels FIRST
     for channel in channels:
         tv_root.append(channel)
 
-    # THEN all programmes
+    # All programmes AFTER channels
     for programme in programmes:
         tv_root.append(programme)
 
     tree = etree.ElementTree(tv_root)
 
     # ======================================
-    # OUTPUT
+    # Output
     # ======================================
 
     os.makedirs(
@@ -471,13 +468,20 @@ def main():
         exist_ok=True
     )
 
-    tree.write(
-        OUTPUT_XML,
-        encoding="utf-8",
-        xml_declaration=True,
-        pretty_print=False
+    # Delete old uncompressed file if one exists
+    old_xml = os.path.join(
+        DIST_DIR,
+        "epg.xml"
     )
 
+    if os.path.exists(old_xml):
+        os.remove(old_xml)
+        print(
+            "Removed old dist/epg.xml "
+            "because it exceeds GitHub's file size limit."
+        )
+
+    # Generate compressed XMLTV directly
     with gzip.open(
         OUTPUT_GZ,
         "wb",
@@ -491,21 +495,15 @@ def main():
             pretty_print=False
         )
 
-    # Legacy/root copy
+    # Compatibility copy
     shutil.copyfile(
         OUTPUT_GZ,
         LEGACY_OUTPUT_GZ
     )
 
     # ======================================
-    # RESULT
+    # Result
     # ======================================
-
-    xml_size_mb = (
-        os.path.getsize(OUTPUT_XML)
-        / 1024
-        / 1024
-    )
 
     gz_size_mb = (
         os.path.getsize(OUTPUT_GZ)
@@ -549,8 +547,8 @@ def main():
     )
 
     print(
-        f"XML size: "
-        f"{xml_size_mb:.2f} MB"
+        f"Skipped invalid programmes: "
+        f"{skipped_programmes_invalid}"
     )
 
     print(
@@ -559,8 +557,11 @@ def main():
     )
 
     print("")
-    print(f"XML: {OUTPUT_XML}")
-    print(f"GZIP: {OUTPUT_GZ}")
+    print(
+        f"EPG output: "
+        f"{OUTPUT_GZ}"
+    )
+
     print(
         f"Compatibility copy: "
         f"{LEGACY_OUTPUT_GZ}"
