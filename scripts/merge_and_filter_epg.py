@@ -19,17 +19,37 @@ BASE_URL = "https://epgshare01.online/epgshare01/"
 
 
 # ==========================================
-# UHF OPTIMIZATION
+# UHF SETTINGS
 # ==========================================
 
-# Small amount of past guide data
+# Keep a small amount of past EPG.
 KEEP_PAST_HOURS = 2
 
-# Future buffer so UHF does not quickly run out of guide data
-KEEP_FUTURE_HOURS = 36
+# Give UHF enough future data if its refresh is delayed.
+KEEP_FUTURE_HOURS = 48
 
-# Keep ALL available channels
+# Normalize all programme times to UTC.
 NORMALIZE_TIMES_TO_UTC = True
+
+
+# ==========================================
+# Programme Metadata
+# ==========================================
+
+# IMPORTANT:
+# DO NOT remove "icon" or "image".
+#
+# UHF can use programme artwork URLs from the EPG.
+#
+# These tags are safe to remove to reduce XML size while
+# keeping titles, descriptions, categories, episode data,
+# programme icons and programme images.
+STRIP_PROGRAMME_TAGS = {
+    "credits",
+    "rating",
+    "star-rating",
+    "review",
+}
 
 
 # ==========================================
@@ -39,7 +59,7 @@ NORMALIZE_TIMES_TO_UTC = True
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 "
-        "(compatible; merged-epg/3.1; "
+        "(compatible; merged-epg/5.0; "
         "+https://github.com/Junior2237/merged-epg-filtered)"
     ),
     "Accept": "*/*",
@@ -52,11 +72,11 @@ HEADERS = {
 
 DIST_DIR = "dist"
 
-# Only compressed EPG is generated.
-# The uncompressed XML was over GitHub's 100 MB limit.
-OUTPUT_GZ = os.path.join(DIST_DIR, "epg.xml.gz")
+OUTPUT_GZ = os.path.join(
+    DIST_DIR,
+    "epg.xml.gz"
+)
 
-# Compatibility copy in repository root
 LEGACY_OUTPUT_GZ = "merged_epg.xml.gz"
 
 
@@ -95,8 +115,13 @@ FILES = [
     "epg_ripper_HK1.xml.gz",
 ]
 
+
 BASE_URL = BASE_URL.rstrip("/") + "/"
-URLS = [BASE_URL + filename for filename in FILES]
+
+URLS = [
+    BASE_URL + filename
+    for filename in FILES
+]
 
 
 # ==========================================
@@ -123,10 +148,20 @@ def parse_xmltv_time(ts):
     tz_string = match.group(2)
 
     if tz_string and tz_string != "Z":
-        sign = 1 if tz_string[0] == "+" else -1
 
-        hours = int(tz_string[1:3])
-        minutes = int(tz_string[3:5])
+        sign = (
+            1
+            if tz_string[0] == "+"
+            else -1
+        )
+
+        hours = int(
+            tz_string[1:3]
+        )
+
+        minutes = int(
+            tz_string[3:5]
+        )
 
         offset = timezone(
             sign * timedelta(
@@ -141,7 +176,9 @@ def parse_xmltv_time(ts):
             .astimezone(timezone.utc)
         )
 
-    return base.replace(tzinfo=timezone.utc)
+    return base.replace(
+        tzinfo=timezone.utc
+    )
 
 
 def format_xmltv_utc(dt):
@@ -167,7 +204,10 @@ def intersects_window(
     window_start,
     window_end
 ):
-    if start_dt is None and stop_dt is None:
+    if (
+        start_dt is None
+        and stop_dt is None
+    ):
         return False
 
     if start_dt is None:
@@ -183,13 +223,199 @@ def intersects_window(
 
 
 # ==========================================
+# Programme Cleanup
+# ==========================================
+
+def strip_unnecessary_metadata(programme):
+    for tag in STRIP_PROGRAMME_TAGS:
+        elements = programme.findall(tag)
+
+        for element in elements:
+            programme.remove(element)
+
+
+# ==========================================
+# Programme Artwork
+# ==========================================
+
+def get_existing_icon_url(programme):
+    for icon in programme.findall("icon"):
+        src = (
+            icon.get("src")
+            or ""
+        ).strip()
+
+        if src.startswith(
+            ("http://", "https://")
+        ):
+            return src
+
+    return None
+
+
+def get_image_url(programme):
+    images = programme.findall("image")
+
+    if not images:
+        return None
+
+    # Prefer poster artwork.
+    preferred_types = [
+        "poster",
+        "backdrop",
+        "still",
+        None,
+    ]
+
+    for preferred_type in preferred_types:
+
+        for image in images:
+
+            image_type = image.get("type")
+
+            if preferred_type is not None:
+                if image_type != preferred_type:
+                    continue
+
+            elif image_type:
+                continue
+
+            url = (
+                image.text
+                or ""
+            ).strip()
+
+            if url.startswith(
+                ("http://", "https://")
+            ):
+                return url
+
+    # Fallback to first usable URL.
+    for image in images:
+
+        url = (
+            image.text
+            or ""
+        ).strip()
+
+        if url.startswith(
+            ("http://", "https://")
+        ):
+            return url
+
+    return None
+
+
+def add_icon_from_image(programme):
+    """
+    Some XMLTV sources use <image>URL</image>
+    instead of <icon src="URL"/>.
+
+    If no programme <icon> exists but an <image>
+    URL exists, create a compatible <icon>.
+    """
+
+    existing_icon = get_existing_icon_url(
+        programme
+    )
+
+    if existing_icon:
+        return False
+
+    image_url = get_image_url(
+        programme
+    )
+
+    if not image_url:
+        return False
+
+    icon = etree.Element(
+        "icon"
+    )
+
+    icon.set(
+        "src",
+        image_url
+    )
+
+    # XMLTV places <icon> after:
+    #
+    # title
+    # sub-title
+    # desc
+    # credits
+    # date
+    # category
+    # keyword
+    # language
+    # orig-language
+    # length
+    #
+    # and before:
+    #
+    # url
+    # country
+    # episode-num
+    # video
+    # audio
+    # image
+    # etc.
+
+    tags_before_icon = {
+        "title",
+        "sub-title",
+        "desc",
+        "credits",
+        "date",
+        "category",
+        "keyword",
+        "language",
+        "orig-language",
+        "length",
+    }
+
+    insert_position = 0
+
+    children = list(programme)
+
+    for index, child in enumerate(
+        children
+    ):
+        if child.tag in tags_before_icon:
+            insert_position = index + 1
+
+    programme.insert(
+        insert_position,
+        icon
+    )
+
+    return True
+
+
+def programme_has_artwork(programme):
+    if get_existing_icon_url(programme):
+        return True
+
+    if get_image_url(programme):
+        return True
+
+    return False
+
+
+# ==========================================
 # Download
 # ==========================================
 
-def fetch_xml(url, retries=3):
+def fetch_xml(
+    url,
+    retries=3
+):
     last_error = None
 
-    for attempt in range(1, retries + 1):
+    for attempt in range(
+        1,
+        retries + 1
+    ):
         try:
             response = requests.get(
                 url,
@@ -201,12 +427,18 @@ def fetch_xml(url, retries=3):
 
             content = response.content
 
-            if content[:2] == b"\x1f\x8b":
-                content = gzip.decompress(content)
+            if (
+                content[:2]
+                == b"\x1f\x8b"
+            ):
+                content = gzip.decompress(
+                    content
+                )
 
             parser = etree.XMLParser(
                 recover=True,
-                huge_tree=True
+                huge_tree=True,
+                remove_blank_text=True
             )
 
             return etree.parse(
@@ -218,13 +450,17 @@ def fetch_xml(url, retries=3):
             last_error = exc
 
             print(
-                f"Attempt {attempt}/{retries} failed "
-                f"for {url}: {exc}",
+                f"Attempt "
+                f"{attempt}/{retries} "
+                f"failed for {url}: "
+                f"{exc}",
                 file=sys.stderr
             )
 
             if attempt < retries:
-                time.sleep(2 * attempt)
+                time.sleep(
+                    2 * attempt
+                )
 
     raise last_error
 
@@ -236,17 +472,19 @@ def fetch_xml(url, retries=3):
 def fallback_to_previous():
     if (
         os.path.exists(OUTPUT_GZ)
-        or os.path.exists(LEGACY_OUTPUT_GZ)
+        or os.path.exists(
+            LEGACY_OUTPUT_GZ
+        )
     ):
         print(
-            "WARNING: No new valid EPG was generated. "
-            "Existing EPG is being preserved."
+            "WARNING: New EPG could not "
+            "be generated. Existing EPG preserved."
         )
+
         sys.exit(0)
 
     print(
-        "ERROR: No programmes were generated "
-        "and no previous EPG exists."
+        "ERROR: No valid EPG exists."
     )
 
     sys.exit(1)
@@ -257,112 +495,182 @@ def fallback_to_previous():
 # ==========================================
 
 def main():
-    now = datetime.now(timezone.utc)
 
-    window_start = now - timedelta(
-        hours=KEEP_PAST_HOURS
+    now = datetime.now(
+        timezone.utc
     )
 
-    window_end = now + timedelta(
-        hours=KEEP_FUTURE_HOURS
+    window_start = (
+        now
+        - timedelta(
+            hours=KEEP_PAST_HOURS
+        )
+    )
+
+    window_end = (
+        now
+        + timedelta(
+            hours=KEEP_FUTURE_HOURS
+        )
     )
 
     print(
-        "EPG window:",
-        window_start.isoformat(),
-        "->",
+        "EPG window:"
+    )
+
+    print(
+        window_start.isoformat()
+    )
+
+    print(
+        "to"
+    )
+
+    print(
         window_end.isoformat()
     )
 
-    # Keep channels and programmes separately.
-    #
-    # XMLTV structure:
-    #
-    # <tv>
-    #   <channel />
-    #   <channel />
-    #   ...
-    #   <programme />
-    #   <programme />
-    # </tv>
 
     channels = []
+
     programmes = []
 
+
     channel_ids_seen = set()
+
     programme_keys_seen = set()
 
+
     sources_ok = 0
+
     sources_failed = 0
 
-    skipped_programmes_time = 0
-    skipped_programmes_duplicate = 0
-    skipped_programmes_invalid = 0
+
+    skipped_time = 0
+
+    skipped_duplicate = 0
+
+    skipped_invalid = 0
+
+
+    programmes_with_icon = 0
+
+    programmes_with_image = 0
+
+    converted_image_to_icon = 0
+
+    programmes_without_artwork = 0
+
+
+    # ======================================
+    # Process Sources
+    # ======================================
 
     for url in URLS:
-        print(f"Downloading: {url}")
+
+        print(
+            f"Downloading: {url}"
+        )
 
         try:
-            document = fetch_xml(url)
+            document = fetch_xml(
+                url
+            )
+
             sources_ok += 1
 
         except Exception as exc:
+
             sources_failed += 1
 
             print(
-                f"WARNING: Failed source: "
-                f"{url} -> {exc}",
+                f"WARNING: "
+                f"{url} failed: "
+                f"{exc}",
                 file=sys.stderr
             )
 
             continue
 
+
         root = document.getroot()
+
 
         # ==================================
         # Channels
         # ==================================
 
-        for channel in root.findall("channel"):
-            channel_id = channel.get("id")
+        for channel in root.findall(
+            "channel"
+        ):
+
+            channel_id = channel.get(
+                "id"
+            )
 
             if not channel_id:
                 continue
 
-            if channel_id in channel_ids_seen:
+            if (
+                channel_id
+                in channel_ids_seen
+            ):
                 continue
 
-            channel_ids_seen.add(channel_id)
-            channels.append(channel)
+            channel_ids_seen.add(
+                channel_id
+            )
+
+            channels.append(
+                channel
+            )
+
 
         # ==================================
         # Programmes
         # ==================================
 
-        for programme in root.findall("programme"):
+        for programme in root.findall(
+            "programme"
+        ):
+
             channel_id = (
-                programme.get("channel")
+                programme.get(
+                    "channel"
+                )
                 or ""
             )
 
             if not channel_id:
-                skipped_programmes_invalid += 1
+
+                skipped_invalid += 1
+
                 continue
 
+
             start_string = (
-                programme.get("start")
+                programme.get(
+                    "start"
+                )
                 or ""
             )
 
             stop_string = (
-                programme.get("stop")
+                programme.get(
+                    "stop"
+                )
                 or ""
             )
 
+
             if NORMALIZE_TIMES_TO_UTC:
+
                 if start_string:
-                    start_string = normalize_time_string(
-                        start_string
+
+                    start_string = (
+                        normalize_time_string(
+                            start_string
+                        )
                     )
 
                     programme.set(
@@ -370,9 +678,13 @@ def main():
                         start_string
                     )
 
+
                 if stop_string:
-                    stop_string = normalize_time_string(
-                        stop_string
+
+                    stop_string = (
+                        normalize_time_string(
+                            stop_string
+                        )
                     )
 
                     programme.set(
@@ -380,17 +692,26 @@ def main():
                         stop_string
                     )
 
-            start_dt = parse_xmltv_time(
-                start_string
+
+            start_dt = (
+                parse_xmltv_time(
+                    start_string
+                )
             )
 
-            stop_dt = parse_xmltv_time(
-                stop_string
+            stop_dt = (
+                parse_xmltv_time(
+                    stop_string
+                )
             )
+
 
             if start_dt is None:
-                skipped_programmes_invalid += 1
+
+                skipped_invalid += 1
+
                 continue
+
 
             if not intersects_window(
                 start_dt,
@@ -398,13 +719,19 @@ def main():
                 window_start,
                 window_end
             ):
-                skipped_programmes_time += 1
+
+                skipped_time += 1
+
                 continue
 
+
             title = (
-                programme.findtext("title")
+                programme.findtext(
+                    "title"
+                )
                 or ""
             ).strip()
+
 
             key = (
                 channel_id,
@@ -413,12 +740,77 @@ def main():
                 title
             )
 
-            if key in programme_keys_seen:
-                skipped_programmes_duplicate += 1
+
+            if (
+                key
+                in programme_keys_seen
+            ):
+
+                skipped_duplicate += 1
+
                 continue
 
-            programme_keys_seen.add(key)
-            programmes.append(programme)
+
+            programme_keys_seen.add(
+                key
+            )
+
+
+            # --------------------------------
+            # Preserve artwork
+            # --------------------------------
+
+            original_icon = (
+                get_existing_icon_url(
+                    programme
+                )
+            )
+
+            original_image = (
+                get_image_url(
+                    programme
+                )
+            )
+
+
+            if original_icon:
+                programmes_with_icon += 1
+
+
+            if original_image:
+                programmes_with_image += 1
+
+
+            # If the provider supplies <image>
+            # but no <icon>, create an icon too.
+            if (
+                not original_icon
+                and original_image
+            ):
+
+                if add_icon_from_image(
+                    programme
+                ):
+                    converted_image_to_icon += 1
+
+
+            if not programme_has_artwork(
+                programme
+            ):
+                programmes_without_artwork += 1
+
+
+            # Remove unnecessary metadata,
+            # but NEVER icon/image artwork.
+            strip_unnecessary_metadata(
+                programme
+            )
+
+
+            programmes.append(
+                programme
+            )
+
 
     # ======================================
     # Validation
@@ -427,37 +819,57 @@ def main():
     if sources_ok == 0:
         fallback_to_previous()
 
+
     if not channels:
         fallback_to_previous()
+
 
     if not programmes:
         fallback_to_previous()
 
+
     # ======================================
-    # Correct XMLTV ordering
+    # XMLTV Root
     # ======================================
 
     tv_root = etree.Element(
         "tv",
         attrib={
-            "generator-info-name": "merged-epg-filtered",
-            "generator-info-url": (
-                "https://github.com/"
-                "Junior2237/"
-                "merged-epg-filtered"
-            )
+            "generator-info-name":
+                "merged-epg-filtered",
+
+            "generator-info-url":
+                (
+                    "https://github.com/"
+                    "Junior2237/"
+                    "merged-epg-filtered"
+                )
         }
     )
 
-    # All channels FIRST
+
+    # All channels first.
+
     for channel in channels:
-        tv_root.append(channel)
 
-    # All programmes AFTER channels
+        tv_root.append(
+            channel
+        )
+
+
+    # Programmes second.
+
     for programme in programmes:
-        tv_root.append(programme)
 
-    tree = etree.ElementTree(tv_root)
+        tv_root.append(
+            programme
+        )
+
+
+    tree = etree.ElementTree(
+        tv_root
+    )
+
 
     # ======================================
     # Output
@@ -468,20 +880,27 @@ def main():
         exist_ok=True
     )
 
-    # Delete old uncompressed file if one exists
+
     old_xml = os.path.join(
         DIST_DIR,
         "epg.xml"
     )
 
-    if os.path.exists(old_xml):
-        os.remove(old_xml)
-        print(
-            "Removed old dist/epg.xml "
-            "because it exceeds GitHub's file size limit."
+
+    if os.path.exists(
+        old_xml
+    ):
+
+        os.remove(
+            old_xml
         )
 
-    # Generate compressed XMLTV directly
+
+    # Write directly to gzip.
+    #
+    # Images themselves are NOT stored in
+    # the XML file. Only their URLs are kept.
+
     with gzip.open(
         OUTPUT_GZ,
         "wb",
@@ -495,76 +914,121 @@ def main():
             pretty_print=False
         )
 
-    # Compatibility copy
+
     shutil.copyfile(
         OUTPUT_GZ,
         LEGACY_OUTPUT_GZ
     )
 
+
     # ======================================
-    # Result
+    # Results
     # ======================================
 
     gz_size_mb = (
-        os.path.getsize(OUTPUT_GZ)
+        os.path.getsize(
+            OUTPUT_GZ
+        )
         / 1024
         / 1024
     )
 
+
     print("")
-    print("====================================")
-    print("EPG BUILD COMPLETE")
-    print("====================================")
+
+    print(
+        "=================================="
+    )
+
+    print(
+        "EPG BUILD COMPLETE"
+    )
+
+    print(
+        "=================================="
+    )
+
 
     print(
         f"Sources OK: "
-        f"{sources_ok}/{len(URLS)}"
+        f"{sources_ok}/"
+        f"{len(URLS)}"
     )
+
 
     print(
         f"Sources failed: "
         f"{sources_failed}"
     )
 
+
     print(
         f"Channels: "
         f"{len(channel_ids_seen)}"
     )
+
 
     print(
         f"Programmes: "
         f"{len(programme_keys_seen)}"
     )
 
+
     print(
         f"Skipped by time: "
-        f"{skipped_programmes_time}"
+        f"{skipped_time}"
     )
+
 
     print(
         f"Skipped duplicates: "
-        f"{skipped_programmes_duplicate}"
+        f"{skipped_duplicate}"
+    )
+
+
+    print(
+        f"Skipped invalid: "
+        f"{skipped_invalid}"
+    )
+
+
+    print("")
+    print(
+        "PROGRAMME ARTWORK"
     )
 
     print(
-        f"Skipped invalid programmes: "
-        f"{skipped_programmes_invalid}"
+        f"Programmes with <icon>: "
+        f"{programmes_with_icon}"
     )
+
+    print(
+        f"Programmes with <image>: "
+        f"{programmes_with_image}"
+    )
+
+    print(
+        f"Converted image -> icon: "
+        f"{converted_image_to_icon}"
+    )
+
+    print(
+        f"Programmes without artwork: "
+        f"{programmes_without_artwork}"
+    )
+
+
+    print("")
 
     print(
         f"GZIP size: "
         f"{gz_size_mb:.2f} MB"
     )
 
-    print("")
+
     print(
         f"EPG output: "
         f"{OUTPUT_GZ}"
-    )
-
-    print(
-        f"Compatibility copy: "
-        f"{LEGACY_OUTPUT_GZ}"
     )
 
 
